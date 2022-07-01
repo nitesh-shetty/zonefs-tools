@@ -38,9 +38,11 @@ struct zio {
 struct zio_params {
 	bool verbose;
 	int fd;
+	int dfd;
 
 	bool read;
 	bool async;
+	bool copy;
 
 	int fflags;
 	bool append;
@@ -49,6 +51,8 @@ struct zio_params {
 
 	size_t iosize;
 	loff_t ioofst;
+	loff_t ioofst_d;
+
 	unsigned int ionum;
 	int ioflags;
 	unsigned int iodepth;
@@ -124,6 +128,32 @@ static inline bool zio_done(struct zio_params *zio)
 }
 
 /*
+ * copy file range.
+ */
+static int zio_copy(struct zio_params *zio)
+{
+	ssize_t ret;
+	loff_t ofst;
+	loff_t ofst_d;
+
+	if(zio->copy) {
+		ofst = zio->ioofst;
+		ofst_d = zio->ioofst_d;
+		ret = copy_file_range(zio->fd, &ofst, zio->dfd, &ofst_d, zio->iosize, 0);
+	}
+	if (ret < 0) {
+		fprintf(stderr, "%05u: copy %zu B at %ld(source) %ld (destination) failed %d (%s)\n",
+			zio->nr_ios,
+			zio->iosize,
+			zio->ioofst, zio->ioofst_d,
+			errno, strerror(errno));
+		return errno;
+	}
+	zio->nr_ios++;
+	return 0;
+}
+
+/*
  * Sync IO run.
  */
 static int zio_run_sync(struct zio_params *zio)
@@ -155,7 +185,6 @@ static int zio_run_sync(struct zio_params *zio)
 				errno, strerror(errno));
 			return errno;
 		}
-
 		zio_vprintf(zio, "%05u: %s %zu B at %ld\n",
 			    zio->nr_ios,
 			    zio->read ? "READ" : "WRITE",
@@ -344,10 +373,13 @@ static void zio_cleanup(struct zio_params *zio)
 		close(zio->fd);
 		zio->fd = -1;
 	}
+	if (zio->dfd > 0) {
+		close(zio->dfd);
+		zio->dfd = -1;
+	}
 }
 
-static int zio_init(struct zio_params *zio, char *path)
-{
+static int zio_init(struct zio_params *zio, char *path, char *path2) {
 	struct stat st;
 	unsigned int i;
 	int ret;
@@ -390,6 +422,20 @@ static int zio_init(struct zio_params *zio, char *path)
 			path, errno, strerror(errno));
 		goto err;
 	}
+	if(zio->copy) {
+		zio->dfd = open(path2, zio->fflags, 0);
+		if (zio->dfd < 0) {
+			fprintf(stderr, "Open %s failed %d (%s)\n",
+				path, errno, strerror(errno));
+			goto err;
+		}
+		ret = fstat(zio->dfd, &st);
+		if (ret) {
+			fprintf(stderr, "Stat %s failed %d (%s)\n",
+				path, errno, strerror(errno));
+			goto err;
+		}
+	}
 	zio->fsize = st.st_size;
 	zio->fmaxsize = st.st_blocks << 9;
 
@@ -419,8 +465,10 @@ static void zio_usage(char *cmd)
 	       "    --vv            : Very verbose output (IOs)\n"
 	       "    --read          : do read (default)\n"
 	       "    --write         : do write\n"
+	       "    --copy          : do copy_file_range\n"
 	       "    --size=<bytes>  : Do <bytes> sized IOs (default: 4096)\n"
 	       "    --ofst=<bytes>  : Start IOs at <offset> (default: 0)\n"
+	       "    --ofst_d=<bytes>: Destination IOs at <offset> (default: 0) - only for CFR\n"
 	       "    --nio=<num>     : Do <num> IOs and exit\n"
 	       "                       (default: IOs until EOF)\n"
 	       "    --async=<depth> : Do asynchronous IOs, issuing at most\n"
@@ -450,7 +498,8 @@ int main(int argc, char **argv)
 	/* Set default values */
 	memset(&zio, 0, sizeof(struct zio_params));
 	zio.fd = -1;
-	zio.read = true;
+	zio.read = false;
+	zio.copy = false;
 	zio.async = false;
 	zio.append = false;
 	zio.fflags = O_LARGEFILE;
@@ -480,6 +529,9 @@ int main(int argc, char **argv)
 		} else if (strcmp(argv[i], "--write") == 0) {
 			zio.read = false;
 			zio.fflags |= O_WRONLY;
+		} else if (strcmp(argv[i], "--copy") == 0) {
+			zio.copy = true;
+			zio.fflags |= O_RDWR;
 		} else if (strncmp(argv[i], "--size=", 7) == 0) {
 			arg = atol(argv[i] + 7);
 			if (arg <= 0) {
@@ -494,6 +546,13 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			zio.ioofst = arg;
+		} else if (strncmp(argv[i], "--ofst_d=", 9) == 0) {
+			arg = atoll(argv[i] + 9);
+			if (arg < 0) {
+				fprintf(stderr, "Invalid IO offset\n");
+				return 1;
+			}
+			zio.ioofst_d = arg;
 		} else if (strncmp(argv[i], "--nio=", 6) == 0) {
 			arg = atoi(argv[i] + 6);
 			if (arg <= 0) {
@@ -541,13 +600,18 @@ int main(int argc, char **argv)
 		}
 	}
 
-	ret = zio_init(&zio, argv[argc - 1]);
+	if (zio.copy)
+		ret = zio_init(&zio, argv[argc - 2], argv[argc - 1]);
+	else
+		ret = zio_init(&zio, argv[argc - 1], NULL);
 	if (ret != 0)
 		return 1;
 
 	start = zio_usec();
 
-	if (zio.async)
+	if (zio.copy)
+		ret = zio_copy(&zio);
+	else if (zio.async)
 		ret = zio_run_async(&zio);
 	else
 		ret = zio_run_sync(&zio);
